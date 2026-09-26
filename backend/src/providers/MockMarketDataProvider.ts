@@ -1,174 +1,165 @@
 /* ============================================================================
-   backend/src/providers/MarketDataProvider.ts
+   backend/src/providers/MockMarketDataProvider.ts
    ----------------------------------------------------------------------------
-   The provider CONTRACT. Every market-data source in this project implements
-   this interface.
+   The mock provider. Kept for local development and unit testing.
 
-   PHASE 4A — real-provider ready.
+   PHASE 4A — updated to the new interface.
    ----------------------------------------------------------------------------
-   Changes in Phase 4A
-     • DataStatus aligned with the Phase 4 lifecycle:
-         'realtime' | 'delayed' | 'historical' | 'unavailable' | 'error'
-       ('not_connected' is intentionally removed; 'unavailable' replaces it.)
-     • Timeframe uses the exact interval strings accepted by Twelve Data.
-     • `getPrice()` added to the interface so the price endpoint reuses the
-       abstraction instead of duck-typing.
-     • `getOHLCV` and `getHistoricalData` return `NormalizedMarketData[] | null`.
-         null  → provider failure / unavailable
-         []    → provider succeeded but returned no rows
-       This lets the API layer distinguish "no data" from "provider error".
-     • `configured` boolean added so the API layer can tell whether the
-       active provider is ready to serve requests (e.g. API key present)
-       without importing a concrete provider.
-     • `errorCode` added to `NormalizedMarketData`. Internal only — used by
-       the API layer to pick a safe HTTP error code. Never shown to clients.
+   • dataStatus is now 'unavailable' (was 'not_connected' in Phase 2).
+   • `configured` is true — the mock is always ready.
+   • `getPrice()` implemented (required by the Phase 4A interface).
+   • getOHLCV / getHistoricalData return `[]` (success, empty) rather than
+     `null`, because the mock never "fails" — it simply has no bars.
+   • Never returns fake prices. Every numeric field is null.
 
-   Design rules
-     • This file contains types and interfaces only.
-     • No runtime logic, no imports from Cloudflare, no network calls.
-     • All methods async — future providers may need network I/O.
-     • No method accepts or returns a secret. Keys live in the concrete
-       provider's private scope, read from `env` at call time.
+   Usage
+     • ENVIRONMENT=test               → selected by MarketService
+     • Unit tests                     → constructed directly
+     • NOT used as a production fallback. Production uses TwelveDataProvider,
+       which returns honest 'unavailable' envelopes when its key is missing.
    ============================================================================ */
 
-import type { Asset, MarketId } from '../types';
+import type { Asset, Env } from '../types';
+import { MARKET_IDS } from '../config';
+import type {
+  MarketDataProvider,
+  NormalizedMarketData,
+  ProviderMarketStatus,
+  Timeframe
+} from './MarketDataProvider';
 
-/* ============================================================================
-   Data freshness — the ONLY vocabulary this project uses to describe
-   whether a row is real, delayed, historical, or missing.
-   ============================================================================ */
-export type DataStatus =
-  /** Freshly observed and verified recent. */
-  | 'realtime'
-  /** Returned by the provider but not confirmed fresh. Conservative default. */
-  | 'delayed'
-  /** Historical bar from a completed interval. */
-  | 'historical'
-  /** Provider cannot serve this request (no key, symbol unsupported, plan
-      limitation). All numeric fields must be null. */
-  | 'unavailable'
-  /** Provider was called and failed (network, HTTP error, malformed body). */
-  | 'error';
+/* ----------------------------------------------------------------------------
+   Helper — build an empty envelope for a given asset
+   ----------------------------------------------------------------------------
+   All numeric fields are null. dataStatus is 'unavailable'. A fresh
+   timestamp is generated so callers can see "the provider was consulted".
+   -------------------------------------------------------------------------- */
+function emptyEnvelope(asset: Asset): NormalizedMarketData {
+  return {
+    symbol: asset.symbol,
+    market: asset.market,
+    timestamp: new Date().toISOString(),
+    price: null,
+    open: null,
+    high: null,
+    low: null,
+    close: null,
+    volume: null,
+    currency: asset.currency,
+    source: null,
+    dataStatus: 'unavailable'
+  };
+}
 
-/* ============================================================================
-   Normalised market data envelope — the shape every provider returns.
-   ============================================================================ */
-export interface NormalizedMarketData {
-  symbol: string;
-  market: MarketId;
-  timestamp: string;
-
-  price: number | null;
-  open: number | null;
-  high: number | null;
-  low: number | null;
-  close: number | null;
-  volume: number | null;
-
-  currency: string;
-
-  /** Provider identifier, e.g. "twelve_data", "mock". Null only if truly unknown. */
-  source: string | null;
-
-  /** Truth about this row. */
-  dataStatus: DataStatus;
+/* ----------------------------------------------------------------------------
+   The provider
+   -------------------------------------------------------------------------- */
+export class MockMarketDataProvider implements MarketDataProvider {
+  /**
+   * Identifier surfaced in responses when the mock is the active provider.
+   * Kept short and lowercase by convention.
+   */
+  readonly name = 'mock';
 
   /**
-   * Internal error identifier used ONLY by the API layer to map provider
-   * failures to a safe HTTP error code. One of:
-   *   'DATA_UNAVAILABLE' | 'INVALID_SYMBOL' | 'PROVIDER_ERROR'
-   *   | 'PROVIDER_RATE_LIMITED' | 'PROVIDER_TIMEOUT'
+   * The mock is always ready — it has no external dependency.
+   */
+  readonly configured = true;
+
+  /**
+   * Accepted for signature parity with real providers that read
+   * `env.MARKET_DATA_API_KEY` / `env.TWELVE_DATA_API_KEY` in their
+   * constructor. The mock reads nothing — the underscore documents intent.
+   */
+  constructor(private readonly _env?: Env) {
+    /* Intentionally empty. */
+  }
+
+  /* ==========================================================================
+     Quotes
+     ========================================================================== */
+
+  /**
+   * Return a "no data" envelope for the asset. Never null — the mock
+   * accepts every asset and reports honestly that no live data exists.
+   */
+  async getQuote(asset: Asset): Promise<NormalizedMarketData | null> {
+    return emptyEnvelope(asset);
+  }
+
+  /**
+   * Same as getQuote. Present so the price endpoint can call a method on
+   * the interface rather than duck-typing the concrete class.
+   */
+  async getPrice(asset: Asset): Promise<NormalizedMarketData | null> {
+    return emptyEnvelope(asset);
+  }
+
+  /* ==========================================================================
+     Candles / bars
+     ========================================================================== */
+
+  /**
+   * Return an empty series. The caller sees a valid array of length zero,
+   * which is unambiguous: "this provider does not supply bars".
    *
-   * Set only when `dataStatus` is 'error' or 'unavailable'.
-   * MUST NOT be surfaced to API clients.
+   * Note: `[]` means success-with-no-rows, NOT failure. The mock never
+   * fails, so it never returns `null`.
    */
-  errorCode?: string;
-}
-
-/* ============================================================================
-   Market status
-   ============================================================================ */
-export interface ProviderMarketStatus {
-  /** The backend supports this market. */
-  enabled: boolean;
-  /**
-   * The provider can currently serve data for this market AND that fact has
-   * been verified. In Phase 4A this is `false` for every market until the
-   * provider has been pinged. It is NEVER true merely because a key exists.
-   */
-  dataConnected: boolean;
-}
-
-/* ============================================================================
-   Timeframe — exact strings accepted by Twelve Data's /time_series endpoint.
-   ============================================================================ */
-export type Timeframe =
-  | '1min'
-  | '5min'
-  | '15min'
-  | '30min'
-  | '1h'
-  | '4h'
-  | '1day'
-  | '1week'
-  | '1month';
-
-/* ============================================================================
-   The interface
-   ============================================================================ */
-export interface MarketDataProvider {
-  /** Short identifier surfaced in responses, e.g. "twelve_data", "mock". */
-  readonly name: string;
+  async getOHLCV(
+    _asset: Asset,
+    _timeframe: Timeframe,
+    _limit: number
+  ): Promise<NormalizedMarketData[] | null> {
+    return [];
+  }
 
   /**
-   * True when the provider has everything it needs to attempt a request
-   * (e.g. an API key). False otherwise. Used by the API layer to add a
-   * `providerConfigured` hint without knowing provider internals.
+   * Same semantics as getOHLCV — empty success, never failure.
    */
-  readonly configured: boolean;
+  async getHistoricalData(
+    _asset: Asset,
+    _fromISO: string,
+    _toISO: string
+  ): Promise<NormalizedMarketData[] | null> {
+    return [];
+  }
 
-  /* --- Quotes ------------------------------------------------------------ */
-
-  /** Latest full quote for a single instrument. */
-  getQuote(asset: Asset): Promise<NormalizedMarketData | null>;
+  /* ==========================================================================
+     Market status
+     ========================================================================== */
 
   /**
-   * Latest price only. Lighter than getQuote. Returns an envelope whose
-   * `dataStatus` reflects honest freshness — 'delayed' unless the provider
-   * can prove otherwise.
+   * Every market is `enabled: true` (the backend supports it) but
+   * `dataConnected: false` (no live provider is answering).
+   *
+   * The keys are drawn from MARKET_IDS in config.ts so this method cannot
+   * drift out of sync — adding a market there automatically includes it here.
    */
-  getPrice(asset: Asset): Promise<NormalizedMarketData | null>;
+  async getMarketStatus(): Promise<Record<string, ProviderMarketStatus>> {
+    const out: Record<string, ProviderMarketStatus> = {};
 
-  /* --- Bars ------------------------------------------------------------- */
+    for (const id of MARKET_IDS) {
+      out[id] = {
+        enabled: true,
+        dataConnected: false
+      };
+    }
+
+    return out;
+  }
+
+  /* ==========================================================================
+     Asset search
+     ========================================================================== */
 
   /**
-   * Most recent OHLCV bars.
-   *   null → provider failure / unavailable
-   *   []   → provider succeeded but returned no rows
+   * Return an empty result set. The authoritative search path in Phase 2/3/4
+   * is AssetResolver, which queries the local registry. This method exists
+   * to satisfy the interface; a future provider will implement real
+   * server-side symbol lookup here.
    */
-  getOHLCV(
-    asset: Asset,
-    timeframe: Timeframe,
-    limit: number
-  ): Promise<NormalizedMarketData[] | null>;
-
-  /**
-   * Historical OHLCV over an explicit inclusive range. Same null/empty
-   * semantics as getOHLCV.
-   */
-  getHistoricalData(
-    asset: Asset,
-    fromISO: string,
-    toISO: string
-  ): Promise<NormalizedMarketData[] | null>;
-
-  /* --- Status ----------------------------------------------------------- */
-
-  /** Per-market availability. Always returns an entry for every MARKET_IDS. */
-  getMarketStatus(): Promise<Record<string, ProviderMarketStatus>>;
-
-  /* --- Search ----------------------------------------------------------- */
-
-  /** Provider-side symbol search (not implemented in Phase 4A). */
-  searchAssets(query: string): Promise<Asset[]>;
+  async searchAssets(_query: string): Promise<Asset[]> {
+    return [];
+  }
 }
