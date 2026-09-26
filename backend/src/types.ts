@@ -3,18 +3,16 @@
    ----------------------------------------------------------------------------
    Shared domain and runtime types for the AI Trading Assistant backend.
 
-   PHASE 2 — Secure backend foundation.
+   PHASE 4A — Twelve Data key + dataStatus on error envelope added.
    ----------------------------------------------------------------------------
    Design rules:
      • This file contains TYPES ONLY. No logic, no constants, no side effects.
        (Runtime constants like MARKET_IDS live in config.ts.)
      • Every type here is exported so individual modules can import only what
        they need. `import type` is used elsewhere to guarantee no runtime cost.
-     • Env declares the FUTURE secret names as optional strings. Nothing in
-       Phase 2 reads them. When Phase 3 begins, they become required where
-       needed without changing this file's shape.
+     • Env declares FUTURE secret names as optional strings. Nothing reads
+       them unless the active code path requires them.
    ============================================================================ */
-
 
 /* ============================================================================
    1. Market identity
@@ -23,9 +21,9 @@
 /**
  * Canonical set of supported market identifiers.
  *
- * Kept structurally identical to `MarketId` exported from `config.ts`
- * (which derives its union from the runtime `MARKET_IDS` array). Having both
- * lets the domain layer stay independent of configuration concerns while
+ * Structurally identical to `MarketId` exported from `config.ts` (which
+ * derives its union from the runtime `MARKET_IDS` array). Having both lets
+ * the domain layer stay independent of configuration concerns while
  * remaining assignment-compatible with anything typed against the other.
  */
 export type MarketId =
@@ -37,8 +35,6 @@ export type MarketId =
 
 /**
  * Higher-level asset classification, distinct from the market.
- * One market can carry several asset types in future (e.g. an index future
- * inside `indices`, a spot and a perpetual inside `crypto`).
  */
 export type AssetType =
   | 'equity'
@@ -46,7 +42,6 @@ export type AssetType =
   | 'forex'
   | 'index'
   | 'commodity';
-
 
 /* ============================================================================
    2. Asset
@@ -68,34 +63,21 @@ export interface Asset {
   /** Which market this instrument belongs to. */
   market: MarketId;
 
-  /**
-   * Exchange or venue code, e.g. "NSE", "NASDAQ", "FX", "generic", "OTC".
-   * Kept as a free string because the taxonomy differs per market and
-   * changes faster than a union would tolerate.
-   */
+  /** Exchange or venue code, e.g. "NSE", "NASDAQ", "FX", "generic", "OTC". */
   exchange: string;
 
-  /**
-   * ISO-style country name of the primary listing, or `null` when the
-   * instrument is not tied to a single jurisdiction (crypto, forex,
-   * many commodities).
-   */
+  /** Country of the primary listing, or `null` when not tied to one. */
   country: string | null;
 
-  /** Quote currency, e.g. "INR", "USD", "USDT". ISO 4217 where applicable. */
+  /** Quote currency, e.g. "INR", "USD", "USDT". */
   currency: string;
 
   /** Coarse classification (see AssetType). */
   assetType: AssetType;
 
-  /**
-   * Optional lowercase alternate spellings used ONLY by the resolver and
-   * search. Never returned in API responses outside `/assets/search` and
-   * `/assets/resolve` — the primary fields are authoritative.
-   */
+  /** Optional lowercase alternate spellings used ONLY by the resolver. */
   aliases?: string[];
 }
-
 
 /* ============================================================================
    3. Environment bindings
@@ -105,12 +87,11 @@ export interface Asset {
  * Cloudflare Worker environment bindings.
  *
  * Populated from `wrangler.toml` ([vars]) and, for anything sensitive, from
- * `wrangler secret put …`. The optional secret fields are declared here so
- * future phases can read `env.MARKET_DATA_API_KEY` without a type change —
- * but no code in Phase 2 reads them.
+ * `wrangler secret put …`. The optional secret fields are declared so
+ * Phase 4A+ code can read them without a type change.
  */
 export interface Env {
-  /** "development" | "production". Set via wrangler.toml [vars]. */
+  /** "development" | "production" | "test". Set via wrangler.toml [vars]. */
   ENVIRONMENT?: string;
 
   /**
@@ -121,19 +102,16 @@ export interface Env {
   ALLOWED_ORIGINS?: string;
 
   /* ------------------------------------------------------------------------
-     FUTURE SECRETS — declared for typing only.
-
-     Populate with:
-         wrangler secret put MARKET_DATA_API_KEY
-         wrangler secret put NEWS_API_KEY
-         wrangler secret put AI_API_KEY
-
-     These values are encrypted at rest by Cloudflare and never appear in
-     the repository. Nothing below is read in Phase 2.
+     Secrets — never appear in source code.
+     Set via:  wrangler secret put <NAME>
+     Local:    place in .dev.vars (git-ignored)
      ---------------------------------------------------------------------- */
 
-  /** Phase 3 — real market data provider key(s). */
+  /** Phase 3+ — generic market data key (reserved). */
   MARKET_DATA_API_KEY?: string;
+
+  /** Phase 4A — Twelve Data API key. REQUIRED for real market data. */
+  TWELVE_DATA_API_KEY?: string;
 
   /** Phase 4/5 — news / sentiment feed key. */
   NEWS_API_KEY?: string;
@@ -141,7 +119,6 @@ export interface Env {
   /** Phase 6 — AI analysis engine key. */
   AI_API_KEY?: string;
 }
-
 
 /* ============================================================================
    4. HTTP API envelopes
@@ -169,9 +146,16 @@ export interface ApiError {
   error: {
     code: string;
     message: string;
-    /** Never populated in Phase 2. Reserved for structured validation errors. */
+    /** Never populated by Phase 4A provider code. Reserved for structured
+        validation errors. */
     details?: unknown;
   };
+  /**
+   * Optional top-level freshness indicator, e.g. 'unavailable' or 'error'.
+   * Present only when a provider failure carries a dataStatus through the
+   * error path. Consumers must treat its absence as "not applicable".
+   */
+  dataStatus?: string;
 }
 
 /** Convenience alias for anything that crosses the wire. */
@@ -180,15 +164,13 @@ export type ApiResponse<T = unknown> =
   | ApiSuccessFlat
   | ApiError;
 
-
 /* ============================================================================
    5. Request context
    ============================================================================ */
 
 /**
  * Everything a route handler needs. Passed explicitly so handlers never
- * reach into globals. Extend this object (not the handler signatures) when
- * future phases need request IDs, caller identity, etc.
+ * reach into globals.
  */
 export interface RequestContext {
   /** Parsed URL of the current request. */
@@ -201,23 +183,17 @@ export interface RequestContext {
   headers: Record<string, string>;
 }
 
-
 /* ============================================================================
    6. ExecutionContext
    ============================================================================ */
 
 /**
  * Minimal structural type for Cloudflare's ExecutionContext.
- *
- * Declared locally instead of importing from @cloudflare/workers-types so
- * that `tsconfig.json` "types" alone is sufficient and this file can be
- * consumed by unit tests that mock the Worker runtime.
  */
 export interface ExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
   passThroughOnException(): void;
 }
-
 
 /* ============================================================================
    7. Utility types
@@ -225,8 +201,7 @@ export interface ExecutionContext {
 
 /**
  * Deep-readonly helper. Useful when a function promises not to mutate data
- * it receives (e.g. the asset registry). Defined here so no module needs to
- * reimplement it.
+ * it receives (e.g. the asset registry).
  */
 export type DeepReadonly<T> = T extends (infer R)[]
   ? ReadonlyArray<DeepReadonly<R>>
@@ -236,8 +211,6 @@ export type DeepReadonly<T> = T extends (infer R)[]
 
 /**
  * Generic result type for service functions that can fail without throwing.
- * Providers in Phase 3+ will use this to avoid exceptions crossing module
- * boundaries.
  */
 export type Result<T, E = string> =
   | { ok: true; value: T }
