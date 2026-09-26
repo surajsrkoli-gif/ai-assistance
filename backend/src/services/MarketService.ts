@@ -4,85 +4,89 @@
    MarketService — the single place that decides WHICH provider answers a
    given market-data request.
 
-   PHASE 2 — Secure backend foundation.
+   PHASE 4A — corrections applied.
    ----------------------------------------------------------------------------
-   Purpose
-     • Decouple the API layer from any specific data provider.
-     • Provide exactly one function the rest of the codebase calls when it
-       needs a MarketDataProvider: `getDefaultProvider(env)`.
-     • Provide a per-asset variant `getProviderForAsset(asset, env)` so that
-       Phase 3 can route stocks → StockProvider, crypto → CryptoProvider,
-       etc., without touching any handler.
+   Fix 5 — No silent mock fallback.
 
-   Design rules
-     • Handlers import from THIS file, never from a concrete provider module.
-       That is the entire point of the abstraction.
-     • `env` is passed in but NOT read in Phase 2. It is accepted now so the
-       signature is stable when Phase 3 starts branching on
-       `env.MARKET_DATA_API_KEY`, `env.ENVIRONMENT`, etc.
-     • No secrets are read, logged, or returned. When Phase 3 needs a key,
-       it will read `env.MARKET_DATA_API_KEY` inside the concrete provider,
-       never here.
-     • Returns a NEW provider instance per call in Phase 2. Providers are
-       stateless, so this is fine; when a provider needs per-request state
-       (rate limit tokens, cached auth), the constructor stays cheap.
+   Selection rules
+     • ENVIRONMENT === 'test'  → MockMarketDataProvider
+       (only explicit test mode uses the mock)
+     • Otherwise               → TwelveDataProvider
+       The Twelve Data provider handles a missing API key honestly by
+       returning 'unavailable' envelopes for every request. It never
+       substitutes fake data, and it never falls back to the mock.
 
-   What this file is NOT
-     • Not a data cache. Caching arrives later, layered on top of providers.
-     • Not a factory pattern for its own sake. There is exactly ONE provider
-       wired up in Phase 2, and this file makes that fact obvious in one line.
+   This guarantees:
+     • Production never returns mock prices, even if the key is missing.
+     • Local development without a key sees honest 'unavailable' responses.
+     • Tests can still exercise the mock via ENVIRONMENT=test.
+     • A future aggregation provider can be slotted in without touching
+       any handler or route — only this file changes.
+
+   Dependency direction
+       api/  →  services/  →  providers/
+
+   Nothing outside this file constructs a concrete provider. That invariant
+   is what keeps the abstraction real rather than cosmetic.
    ============================================================================ */
 
 import { MockMarketDataProvider } from '../providers/MockMarketDataProvider';
+import { TwelveDataProvider } from '../providers/TwelveDataProvider';
 import type { MarketDataProvider } from '../providers/MarketDataProvider';
 import type { Asset, Env } from '../types';
 
 /* ----------------------------------------------------------------------------
+   Explicit test mode
+   ----------------------------------------------------------------------------
+   Set ENVIRONMENT=test in .dev.vars or in wrangler.toml [vars] to opt in.
+   Production must never have this set — the check is exact-string equality
+   so a typo like "Testing" or "TEST " does not silently enable the mock in
+   production.
+   -------------------------------------------------------------------------- */
+function isTestMode(env: Env): boolean {
+  return env.ENVIRONMENT === 'test';
+}
+
+/* ----------------------------------------------------------------------------
    Per-asset provider selection
    ----------------------------------------------------------------------------
-   Phase 2: ALWAYS returns the mock provider.
+   Phase 4A: always TwelveDataProvider (outside test mode).
 
-   Phase 3+ will switch on `asset.market`, e.g.:
+   Phase 4B+ will switch on `asset.market` once multiple real providers are
+   wired up:
 
        switch (asset.market) {
-         case 'stocks':      return new StockMarketDataProvider(env);
-         case 'forex':       return new ForexMarketDataProvider(env);
-         case 'crypto':      return new CryptoMarketDataProvider(env);
-         case 'indices':     return new IndicesMarketDataProvider(env);
-         case 'commodities': return new CommodityMarketDataProvider(env);
-         default:            return new MockMarketDataProvider();
+         case 'stocks': return new StockMarketDataProvider(env);
+         case 'crypto': return new CryptoMarketDataProvider(env);
+         ...
        }
 
-   The public signature is intentionally identical to the Phase 3 version,
-   so callers do not change when the switch is introduced.
+   The public signature is intentionally identical to that future shape, so
+   callers do not change when the switch is introduced.
    -------------------------------------------------------------------------- */
 export function getProviderForAsset(
   _asset: Asset | null,
-  _env: Env
+  env: Env
 ): MarketDataProvider {
-  // Phase 2 — only mock is wired up. `_asset` and `_env` are accepted but
-  // not yet used; the leading underscore documents that intent to readers
-  // and to the TypeScript compiler.
-  return new MockMarketDataProvider();
+  if (isTestMode(env)) {
+    return new MockMarketDataProvider(env);
+  }
+  return new TwelveDataProvider(env);
 }
 
 /* ----------------------------------------------------------------------------
    Default provider selection
    ----------------------------------------------------------------------------
-   Used when there is no asset in hand yet — for example when answering
-   /api/v1/market/status, which reports on ALL markets at once.
+   Used when there is no asset in scope — for example /api/v1/market/status,
+   which reports on all markets at once.
 
-   Phase 2: ALWAYS returns the mock provider.
-
-   Phase 3+ will branch on env presence, e.g.:
-
-       if (env.MARKET_DATA_API_KEY) {
-         return new AggregatedMarketDataProvider(env);
-       }
-       return new MockMarketDataProvider();
-
-   The signature stays `(env: Env) => MarketDataProvider` either way.
+   Phase 4A: always TwelveDataProvider (outside test mode). The provider
+   itself reports honest `dataConnected: false` for every market until
+   connectivity is verified.
    -------------------------------------------------------------------------- */
-export function getDefaultProvider(_env: Env): MarketDataProvider {
-  return new MockMarketDataProvider();
+export function getDefaultProvider(env: Env): MarketDataProvider {
+  if (isTestMode(env)) {
+    return new MockMarketDataProvider(env);
+  }
+  return new TwelveDataProvider(env);
 }
