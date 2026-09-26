@@ -1,0 +1,35 @@
+{
+  "name": "ai-trading-assistant-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Phase 2 secure backend foundation for AI Trading Assistant. Cloudflare Workers. No market APIs connected, no AI, no authentication.",
+  "license": "UNLICENSED",
+  "author": "surajsrkoli-gif",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:prod": "wrangler deploy --env production",
+    "typecheck": "tsc --noEmit",
+    "tail": "wrangler tail",
+    "tail:prod": "wrangler tail --env production",
+    "whoami": "wrangler whoami",
+    "logout": "wrangler logout"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "typescript": "^5.5.4",
+    "wrangler": "^3.78.0"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "serverless",
+    "trading-assistant",
+    "phase-2",
+    "typescript"
+  ]
+}
