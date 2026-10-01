@@ -1,142 +1,96 @@
 /* ============================================================================
    backend/src/providers/symbolMapping.ts
    ----------------------------------------------------------------------------
-   Provider symbol mapping layer.
+   Static symbol mapping and normalization helpers.
 
-   PHASE 4A — Twelve Data integration.
-   ----------------------------------------------------------------------------
-   Purpose
-     • Translate an internal Asset into the symbol string expected by a
-       specific external provider.
-     • Keep the mapping logic in one place so additional providers (Polygon,
-       Alpha Vantage, etc.) can have their own mapping modules without
-       polluting the provider implementations.
+   PHASE 4A — normalizeUserInput added.
 
-   Design rules
-     • Pure functions only. No I/O, no env access, no side effects.
-     • The internal registry (assetRegistry.ts) remains the source of truth
-       for asset identity. This module only translates.
-     • Any symbol without an explicit mapping returns the internal symbol
-       unchanged. The provider is responsible for handling an upstream
-       404/error for an unknown symbol — this module never guesses.
-     • Conservative by design: a symbol is only added here when its upstream
-       mapping is documented by the provider. Do not speculate.
+   Responsibilities
+     • Provide the static mapping table used as Layer 2 of resolution.
+     • Report whether a symbol has an explicit mapping.
+     • Normalize free-form user input for the resolver cache key.
 
-   Scope in Phase 4A
-     • Twelve Data is the only target provider.
-     • The mapping below covers only the instruments where the internal
-       symbol differs from Twelve Data's expected form.
+   What this file is NOT
+     • Not a symbol-discovery mechanism. That lives in SymbolResolver.ts
+       and TwelveDataProvider.resolveSymbol().
+     • Not the source of truth for asset identity. The registry is.
+
+   The map is intentionally minimal. Entries appear only when the internal
+   symbol differs materially from the provider symbol, or when the provider
+   form has been verified to work on the active plan (e.g. INFY).
+   Direct-passthrough symbols (AAPL, EUR/USD, BTC/USDT) do NOT appear here.
    ============================================================================ */
 
 import type { Asset } from '../types';
 
 /* ----------------------------------------------------------------------------
-   Twelve Data symbol table
+   Static mapping table — Layer 2 of resolution
    ----------------------------------------------------------------------------
-   Only assets whose internal symbol differs from the Twelve Data symbol
-   appear here. Everything else passes through unchanged via the fallback
-   in `toProviderSymbol()`.
-
-   Format notes
-     • NSE-listed stocks use the "SYMBOL:NSE" form, e.g. "RELIANCE:NSE".
-     • US-listed stocks (AAPL, TSLA) and crypto pairs (BTC/USDT, ETH/USDT)
-       and FX pairs (EUR/USD, GBP/USD, USD/JPY) are already valid Twelve
-       Data symbols, so they are NOT listed here.
-     • Indices use their widely-recognised provider codes:
-         S&P 500    → SPX
-         NASDAQ 100 → NDX
-       NIFTY 50 and BANK NIFTY are passed through with their internal form;
-       the provider decides whether the plan supports them.
-     • Commodities use spot-metal / futures codes where the provider has a
-       well-known symbol:
-         GOLD      → XAU/USD
-         SILVER    → XAG/USD
-         CRUDE OIL → WTI/USD
+   Do not remove INFY:NSE — it is verified to work on the current plan.
+   Do not add more colon-form entries speculatively; the resolver's search
+   layer handles discovery for symbols the plan may or may not cover.
    -------------------------------------------------------------------------- */
-const TD_SYMBOL_MAP: Readonly<Record<string, string>> = {
-  /* ------------------------------ STOCKS (NSE) --------------------------- */
-  RELIANCE: 'RELIANCE:NSE',
-  TCS: 'TCS:NSE',
+const TD_SYMBOL_MAP: Readonly<Record<string, string>> = Object.freeze({
+  /* --- NSE stocks (only the ones verified to work on the plan) ----------- */
   INFY: 'INFY:NSE',
 
-  /* ------------------------------ STOCKS (US) --------------------------- */
-  /* AAPL, TSLA — no mapping needed; internal symbol matches Twelve Data. */
-
-  /* -------------------------------- CRYPTO ------------------------------ */
-  /* BTC/USDT, ETH/USDT — no mapping needed. */
-
-  /* -------------------------------- FOREX ------------------------------- */
-  /* EUR/USD, GBP/USD, USD/JPY — no mapping needed. */
-
-  /* ------------------------------- INDICES ------------------------------ */
+  /* --- Indices ----------------------------------------------------------- */
   'S&P 500': 'SPX',
-  'NASDAQ 100': 'NDX'
+  'NASDAQ 100': 'NDX',
 
-  /* NIFTY 50 and BANK NIFTY — no explicit mapping in Phase 4A. The provider
-     will return an honest "unavailable" if the plan cannot serve them. */
-
-  /* ----------------------------- COMMODITIES ---------------------------- */
-  /* GOLD, SILVER, CRUDE OIL are mapped below as a second block to keep the
-     table readable. Object literal order does not matter. */
-};
-
-/* Second block kept separate for readability — see comment above. */
-const TD_SYMBOL_MAP_COMMODITIES: Readonly<Record<string, string>> = {
+  /* --- Commodities ------------------------------------------------------- */
   GOLD: 'XAU/USD',
   SILVER: 'XAG/USD',
   'CRUDE OIL': 'WTI/USD'
-};
-
-/* Merge the two blocks into one lookup. Frozen so no caller can mutate it. */
-const TD_SYMBOL_LOOKUP: Readonly<Record<string, string>> = Object.freeze({
-  ...TD_SYMBOL_MAP,
-  ...TD_SYMBOL_MAP_COMMODITIES
 });
+
+/* ----------------------------------------------------------------------------
+   Normalization
+   ----------------------------------------------------------------------------
+   Canonical form used as the resolver cache key and for comparisons:
+   trimmed, uppercased, single spaces between tokens.
+
+   Exported here so both the resolver cache (services/SymbolResolver.ts) and
+   the provider (providers/TwelveDataProvider.ts) share one definition. Do
+   not reimplement this anywhere else.
+   -------------------------------------------------------------------------- */
+export function normalizeUserInput(input: string): string {
+  if (typeof input !== 'string') return '';
+  return input.trim().toUpperCase().replace(/\s+/g, ' ');
+}
 
 /* ----------------------------------------------------------------------------
    Public API
    -------------------------------------------------------------------------- */
 
 /**
- * Translate an internal Asset into the Twelve Data symbol string.
- *
- * Returns the mapped symbol when an explicit mapping exists, otherwise
- * returns `asset.symbol` unchanged. The caller does not need to know
- * whether a mapping was applied — the returned string is always the value
- * that should be sent to the provider.
- *
- * @param asset Any Asset from the internal registry.
- * @returns The provider symbol, never empty.
+ * Return the mapped provider symbol for an asset, or asset.symbol unchanged
+ * when no mapping exists.
  */
 export function toProviderSymbol(asset: Asset): string {
   const symbol = asset.symbol;
   if (
     typeof symbol === 'string' &&
-    Object.prototype.hasOwnProperty.call(TD_SYMBOL_LOOKUP, symbol)
+    Object.prototype.hasOwnProperty.call(TD_SYMBOL_MAP, symbol)
   ) {
-    return TD_SYMBOL_LOOKUP[symbol];
+    return TD_SYMBOL_MAP[symbol];
   }
   return symbol;
 }
 
 /**
- * Report whether an asset has an explicit Twelve Data mapping.
- *
- * Assets without a mapping may still work — Twelve Data accepts many symbols
- * directly. A `false` return means "no explicit translation was needed",
- * NOT "this asset is unsupported".
+ * Report whether an asset has an explicit mapping.
  */
 export function hasExplicitMapping(asset: Asset): boolean {
   return (
     typeof asset.symbol === 'string' &&
-    Object.prototype.hasOwnProperty.call(TD_SYMBOL_LOOKUP, asset.symbol)
+    Object.prototype.hasOwnProperty.call(TD_SYMBOL_MAP, asset.symbol)
   );
 }
 
 /**
- * Read-only view of the mapping table, for diagnostics and tests.
- * Do not mutate the returned object.
+ * Read-only view of the mapping table. For diagnostics and tests.
  */
 export function getSymbolMap(): Readonly<Record<string, string>> {
-  return TD_SYMBOL_LOOKUP;
+  return TD_SYMBOL_MAP;
 }
