@@ -5,25 +5,40 @@
 
    PHASE 4A — diagnostic version.
 
-   Key changes
-     1. classifyUpstreamError() takes an `isQuoteLikeEndpoint` flag. On
-        quote-like endpoints (/quote, /price, /time_series), HTTP 200 with
-        body.code === 400 is classified as INVALID_SYMBOL. Twelve Data uses
-        that exact shape for "Symbol is invalid or not found". Without this,
-        the recovery branch was unreachable.
-     2. fetchWithResolution() logs every stage of recovery with logEvent().
-        Visible only via `wrangler tail`. The API key and the full URL are
-        never logged.
-     3. When a resolution succeeds but the retry still fails with
+   Key behaviours
+     1. classifyUpstreamError() accepts `isQuoteLikeEndpoint`. On quote-like
+        endpoints (/quote, /price, /time_series), HTTP 200 with body.code
+        === 400 is classified as INVALID_SYMBOL. Twelve Data uses that exact
+        shape for "Symbol is invalid or not found". Without this, the
+        symbol-recovery branch was unreachable.
+     2. Every stage of recovery emits a structured log line via logEvent():
+          symbol_recovery_start
+          symbol_search_start
+          symbol_search_result
+          symbol_resolution_ok
+          symbol_recovery_ok
+          symbol_recovery_plan_limited
+          symbol_recovery_same_symbol
+          symbol_recovery_retry_failed
+          symbol_search_failed
+          symbol_search_no_match
+          symbol_resolution_empty
+          symbol_resolution_cache_hit
+          symbol_resolution_cache_hit_negative
+        Visible only via `wrangler tail`. The API key and the full upstream
+        URL are never logged.
+     3. If a search resolves a symbol but the retry still fails with
         INVALID_SYMBOL, the failure is remapped to DATA_UNAVAILABLE — the
         symbol was found; the plan cannot serve it.
-     4. Crypto/forex require exact pair matching (handled in SymbolResolver).
-     5. No mock fallback. No fabricated symbols. No secret exposure.
+     4. No mock fallback. No fabricated symbols. No secret exposure.
+     5. At most 3 upstream calls per unresolved request: quote + search +
+        retry.
 
-   Guarantees
-     • At most 3 upstream calls per unresolved request: quote + search + retry.
-     • AAPL, EUR/USD, INFY succeed on the first attempt, zero searches.
-     • All failures map to the same envelope shape as before.
+   Security invariants
+     • API key read only from env.TWELVE_DATA_API_KEY.
+     • Never logged, never returned, never echoed in errors.
+     • /symbol_search results are reduced to ResolvedProviderSymbol before
+       leaving this file.
    ============================================================================ */
 
 import type { Asset, Env } from '../types';
@@ -97,7 +112,9 @@ interface TwelveDataSeriesBody extends TwelveDataErrorFields {
    2. Diagnostic logging
    ----------------------------------------------------------------------------
    Structured JSON lines. Visible only via `wrangler tail`. The API key and
-   the full upstream URL are never included.
+   the full upstream URL are never included. The fields logged below are
+   strictly: event, query, market, endpoint, providerSymbol, exchange,
+   errorCode, dataStatus, resultCount, attemptedSymbol, resolvedSymbol.
    ============================================================================ */
 function logEvent(event: string, fields: Record<string, unknown>): void {
   try {
