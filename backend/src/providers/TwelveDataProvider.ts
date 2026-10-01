@@ -1,85 +1,78 @@
 /* ============================================================================
    backend/src/providers/TwelveDataProvider.ts
    ----------------------------------------------------------------------------
-   Twelve Data market data provider.
+   Twelve Data market data provider with layered symbol resolution.
 
-   PHASE 4A — corrections applied.
-   ----------------------------------------------------------------------------
-   Fixes vs. the previous draft
-     2. /price no longer claims 'realtime'. Twelve Data's /price response has
-        no timestamp, so the value is reported as 'delayed' unless a reliable
-        freshness signal is available.
-     3. getMarketStatus() no longer derives dataConnected from key presence.
-        It always reports `dataConnected: false` in Phase 4A. A provider-level
-        `configured` getter exposes whether a key is present, without
-        pretending any market is verified.
-     5. Missing key → 'unavailable' envelopes. The mock is never used as a
-        silent fallback inside this provider.
-     9. All upstream errors map to safe internal codes. Raw messages, URLs,
-        API keys, and stack traces never leave this file.
-    10. Provider failures never masquerade as empty success. OHLCV and
-        history return `null` on failure, `[]` only when the provider
-        genuinely returned zero rows.
+   PHASE 4A — diagnostic version.
 
-   Security invariants
-     • API key read ONLY from env.TWELVE_DATA_API_KEY.
-     • Key appended to URLs inside this file, never logged, never returned.
-     • Upstream error bodies inspected only for classification, never surfaced.
-     • Every fetch is wrapped in try/catch; nothing escapes to the router.
-     • AbortController + timeout prevents hanging the Worker on slow upstream.
+   Key changes
+     1. classifyUpstreamError() takes an `isQuoteLikeEndpoint` flag. On
+        quote-like endpoints (/quote, /price, /time_series), HTTP 200 with
+        body.code === 400 is classified as INVALID_SYMBOL. Twelve Data uses
+        that exact shape for "Symbol is invalid or not found". Without this,
+        the recovery branch was unreachable.
+     2. fetchWithResolution() logs every stage of recovery with logEvent().
+        Visible only via `wrangler tail`. The API key and the full URL are
+        never logged.
+     3. When a resolution succeeds but the retry still fails with
+        INVALID_SYMBOL, the failure is remapped to DATA_UNAVAILABLE — the
+        symbol was found; the plan cannot serve it.
+     4. Crypto/forex require exact pair matching (handled in SymbolResolver).
+     5. No mock fallback. No fabricated symbols. No secret exposure.
 
-   Interface compliance
-     • Implements MarketDataProvider from ./MarketDataProvider.ts exactly.
-     • `configured` is a getter (interface requires readonly boolean).
-     • `getPrice` is a first-class method (no duck-typing from callers).
-     • Bars methods return `NormalizedMarketData[] | null` per the interface.
+   Guarantees
+     • At most 3 upstream calls per unresolved request: quote + search + retry.
+     • AAPL, EUR/USD, INFY succeed on the first attempt, zero searches.
+     • All failures map to the same envelope shape as before.
    ============================================================================ */
 
 import type { Asset, Env } from '../types';
-import { MARKET_IDS } from '../config';
+import { MARKET_IDS, ERROR_CODES } from '../config';
 import {
   TD_BASE_URL,
   TD_ALLOWED_INTERVALS,
   TD_MAX_OUTPUT_SIZE,
-  TD_DEFAULT_OUTPUT_SIZE,
-  ERROR_CODES
+  TD_DEFAULT_OUTPUT_SIZE
 } from '../config';
 import type {
   MarketDataProvider,
   NormalizedMarketData,
   ProviderMarketStatus,
+  ResolvedProviderSymbol,
   Timeframe
 } from './MarketDataProvider';
-import { toProviderSymbol } from './symbolMapping';
+import { toProviderSymbol, normalizeUserInput } from './symbolMapping';
+import {
+  getCachedResolution,
+  isNegativeCached,
+  cacheResolved,
+  cacheNegative,
+  selectBestMatch,
+  toResolvedSymbol,
+  type TwelveDataSymbolSearchResponse
+} from '../services/SymbolResolver';
+import { resolveAsset } from '../services/AssetResolver';
 
 /* ============================================================================
-   Internal Twelve Data response shapes
-   ----------------------------------------------------------------------------
-   Only the fields we actually read. Anything else in the upstream payload
-   is ignored on purpose — we never forward opaque provider data.
+   1. Response shapes
    ============================================================================ */
 
 interface TwelveDataErrorFields {
-  status?: string;   /* "ok" | "error" */
-  code?: number;     /* HTTP-ish code on error */
-  message?: string;  /* human-readable error from Twelve Data */
+  status?: string;
+  code?: number;
+  message?: string;
 }
 
 interface TwelveDataQuoteBody extends TwelveDataErrorFields {
   symbol?: string;
-  name?: string;
-  exchange?: string;
   currency?: string;
   datetime?: string;
-  timestamp?: number;   /* unix seconds */
+  timestamp?: number;
   open?: string;
   high?: string;
   low?: string;
   close?: string;
   volume?: string;
-  previous_close?: string;
-  change?: string;
-  percent_change?: string;
 }
 
 interface TwelveDataPriceBody extends TwelveDataErrorFields {
@@ -96,25 +89,27 @@ interface TwelveDataBar {
 }
 
 interface TwelveDataSeriesBody extends TwelveDataErrorFields {
-  meta?: {
-    symbol?: string;
-    interval?: string;
-    currency?: string;
-    exchange?: string;
-  };
+  meta?: { currency?: string };
   values?: TwelveDataBar[];
 }
 
 /* ============================================================================
-   Internal error classification
-   ============================================================================
-   Map an upstream HTTP status + Twelve Data body into an internal pair:
-     { dataStatus, errorCode }
-
-   errorCode values come from ERROR_CODES in config.ts, restricted to the
-   provider-level subset that the API layer understands.
+   2. Diagnostic logging
+   ----------------------------------------------------------------------------
+   Structured JSON lines. Visible only via `wrangler tail`. The API key and
+   the full upstream URL are never included.
    ============================================================================ */
+function logEvent(event: string, fields: Record<string, unknown>): void {
+  try {
+    console.log(JSON.stringify({ event, ...fields }));
+  } catch {
+    console.log('[ata] ' + event);
+  }
+}
 
+/* ============================================================================
+   3. Error classification
+   ============================================================================ */
 interface ClassifiedError {
   dataStatus: NormalizedMarketData['dataStatus'];
   errorCode: string;
@@ -122,61 +117,46 @@ interface ClassifiedError {
 
 function classifyUpstreamError(
   httpStatus: number,
-  body: TwelveDataErrorFields | null
+  body: TwelveDataErrorFields | null,
+  isQuoteLikeEndpoint: boolean
 ): ClassifiedError {
-  /* Prefer the upstream code when it looks HTTP-like; otherwise fall back
-     to the HTTP status we already have. */
   const code =
     body && typeof body.code === 'number' && body.code > 0
       ? body.code
       : httpStatus;
 
-  /* --- Rate limit -------------------------------------------------------- */
   if (httpStatus === 429 || code === 429) {
-    return {
-      dataStatus: 'error',
-      errorCode: ERROR_CODES.PROVIDER_RATE_LIMITED
-    };
+    return { dataStatus: 'error', errorCode: ERROR_CODES.PROVIDER_RATE_LIMITED };
   }
 
-  /* --- Auth / permission ------------------------------------------------- */
-  /* Do NOT reveal whether the key is missing, invalid, or simply lacks
-     the required plan. All three collapse into a single safe code. */
-  if (httpStatus === 401 || httpStatus === 403 || code === 401 || code === 403) {
-    return {
-      dataStatus: 'error',
-      errorCode: ERROR_CODES.PROVIDER_ERROR
-    };
+  if (httpStatus === 401 || code === 401) {
+    return { dataStatus: 'error', errorCode: ERROR_CODES.PROVIDER_ERROR };
   }
 
-  /* --- Unknown symbol ---------------------------------------------------- */
+  if (httpStatus === 403 || code === 403) {
+    return { dataStatus: 'unavailable', errorCode: ERROR_CODES.DATA_UNAVAILABLE };
+  }
+
   if (httpStatus === 404 || code === 404) {
-    return {
-      dataStatus: 'unavailable',
-      errorCode: ERROR_CODES.INVALID_SYMBOL
-    };
+    return { dataStatus: 'unavailable', errorCode: ERROR_CODES.INVALID_SYMBOL };
   }
 
-  /* --- Provider-side failure --------------------------------------------- */
+  /* Twelve Data returns HTTP 200 with code 400 for unrecognised symbols on
+     quote-like endpoints. Classify as INVALID_SYMBOL so the recovery path
+     runs. On /symbol_search, a 400 keeps its meaning as a provider error. */
+  if (isQuoteLikeEndpoint && (httpStatus === 400 || code === 400)) {
+    return { dataStatus: 'unavailable', errorCode: ERROR_CODES.INVALID_SYMBOL };
+  }
+
   if (httpStatus >= 500 || code >= 500) {
-    return {
-      dataStatus: 'error',
-      errorCode: ERROR_CODES.PROVIDER_ERROR
-    };
+    return { dataStatus: 'error', errorCode: ERROR_CODES.PROVIDER_ERROR };
   }
 
-  /* --- Fallback ---------------------------------------------------------- */
-  return {
-    dataStatus: 'error',
-    errorCode: ERROR_CODES.PROVIDER_ERROR
-  };
+  return { dataStatus: 'error', errorCode: ERROR_CODES.PROVIDER_ERROR };
 }
 
 /* ============================================================================
-   Numeric parsing
-   ============================================================================
-   Returns null when the value is missing, empty, or not a finite number.
-   Never fabricates a value — a missing field stays missing.
+   4. Helpers
    ============================================================================ */
 function parseNumber(
   value: string | number | undefined | null
@@ -188,12 +168,6 @@ function parseNumber(
   return Number.isFinite(num) ? num : null;
 }
 
-/* ============================================================================
-   URL builder
-   ============================================================================
-   The API key is appended here and NOWHERE else in the codebase. The
-   returned URL is never logged or returned to a client.
-   ============================================================================ */
 function buildUrl(
   path: string,
   params: Record<string, string>,
@@ -204,19 +178,8 @@ function buildUrl(
     qs.set(key, value);
   }
   qs.set('apikey', apiKey);
-  return `${TD_BASE_URL}${path}?${qs.toString()}`;
+  return TD_BASE_URL + path + '?' + qs.toString();
 }
-
-/* ============================================================================
-   Fetch helper
-   ============================================================================
-   One place for:
-     • timeout (AbortController, 10 s)
-     • JSON parsing (fails soft to null)
-     • upstream error classification
-
-   Never throws. Never logs. Never returns the URL.
-   ============================================================================ */
 
 interface FetchOutcome<T> {
   ok: boolean;
@@ -224,9 +187,16 @@ interface FetchOutcome<T> {
   classified?: ClassifiedError;
 }
 
+interface SafeFetchOptions {
+  isQuoteLikeEndpoint?: boolean;
+}
+
 async function safeFetch<T extends TwelveDataErrorFields>(
-  url: string
+  url: string,
+  options: SafeFetchOptions = {}
 ): Promise<FetchOutcome<T>> {
+  const isQuoteLikeEndpoint = options.isQuoteLikeEndpoint === true;
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
 
@@ -245,27 +215,24 @@ async function safeFetch<T extends TwelveDataErrorFields>(
       return {
         ok: false,
         body,
-        classified: classifyUpstreamError(res.status, body)
+        classified: classifyUpstreamError(res.status, body, isQuoteLikeEndpoint)
       };
     }
 
-    /* Twelve Data sometimes returns HTTP 200 with { status: "error" }. */
     if (body && body.status === 'error') {
       return {
         ok: false,
         body,
-        classified: classifyUpstreamError(res.status, body)
+        classified: classifyUpstreamError(res.status, body, isQuoteLikeEndpoint)
       };
     }
 
     return { ok: true, body };
   } catch (err) {
     clearTimeout(timeoutId);
-
     const isAbort =
       err instanceof Error &&
       (err.name === 'AbortError' || err.name === 'TimeoutError');
-
     return {
       ok: false,
       body: null,
@@ -280,32 +247,16 @@ async function safeFetch<T extends TwelveDataErrorFields>(
 }
 
 /* ============================================================================
-   The provider
+   5. Provider
    ============================================================================ */
 export class TwelveDataProvider implements MarketDataProvider {
   readonly name = 'twelve_data';
 
-  constructor(private readonly env: Env) {
-    /* Nothing is read in the constructor. The API key is fetched lazily on
-       each call via readKey(). This keeps the provider safe to construct
-       even when the secret is absent, and it never caches a secret longer
-       than necessary. */
-  }
+  constructor(private readonly env: Env) {}
 
-  /* ------------------------------------------------------------------------
-     `configured` — interface requirement
-     ------------------------------------------------------------------------
-     True only when a non-empty API key is present in env. Used by the API
-     layer to add a `providerConfigured` hint to /market/status without
-     importing a concrete provider. It does NOT imply connectivity.
-     ---------------------------------------------------------------------- */
   get configured(): boolean {
     return this.readKey() !== null;
   }
-
-  /* ==========================================================================
-     Private helpers
-     ========================================================================== */
 
   private readKey(): string | null {
     const key = this.env.TWELVE_DATA_API_KEY;
@@ -337,6 +288,205 @@ export class TwelveDataProvider implements MarketDataProvider {
     return envelope;
   }
 
+  /* ------------------------------------------------------------------------
+     Private: cached resolution via /symbol_search
+     ------------------------------------------------------------------------ */
+  private async resolveProviderSymbol(
+    cacheKey: string,
+    asset: Asset,
+    apiKey: string
+  ): Promise<ResolvedProviderSymbol | null> {
+    const positive = getCachedResolution(cacheKey);
+    if (positive) {
+      logEvent('symbol_resolution_cache_hit', {
+        query: cacheKey,
+        providerSymbol: positive.providerSymbol
+      });
+      return positive;
+    }
+
+    if (isNegativeCached(cacheKey)) {
+      logEvent('symbol_resolution_cache_hit_negative', { query: cacheKey });
+      return null;
+    }
+
+    logEvent('symbol_search_start', {
+      query: cacheKey,
+      market: asset.market
+    });
+
+    const url = buildUrl(
+      '/symbol_search',
+      { symbol: cacheKey, outputsize: '10' },
+      apiKey
+    );
+
+    const outcome = await safeFetch<TwelveDataSymbolSearchResponse>(url, {
+      isQuoteLikeEndpoint: false
+    });
+
+    if (!outcome.ok || !outcome.body) {
+      logEvent('symbol_search_failed', {
+        query: cacheKey,
+        errorCode: outcome.classified?.errorCode ?? 'UNKNOWN',
+        dataStatus: outcome.classified?.dataStatus ?? 'error'
+      });
+      /* Do NOT cache a negative here. The search itself failed — a later
+         request may succeed. */
+      return null;
+    }
+
+    const results = Array.isArray(outcome.body.data) ? outcome.body.data : [];
+    logEvent('symbol_search_result', {
+      query: cacheKey,
+      resultCount: results.length
+    });
+
+    const best = selectBestMatch(results, asset);
+    if (!best) {
+      logEvent('symbol_search_no_match', {
+        query: cacheKey,
+        market: asset.market
+      });
+      cacheNegative(cacheKey);
+      return null;
+    }
+
+    const resolved = toResolvedSymbol(best, asset.market);
+    if (!resolved) {
+      logEvent('symbol_resolution_empty', {
+        query: cacheKey,
+        matchedSymbol: best.symbol ?? null
+      });
+      cacheNegative(cacheKey);
+      return null;
+    }
+
+    logEvent('symbol_resolution_ok', {
+      query: cacheKey,
+      providerSymbol: resolved.providerSymbol,
+      exchange: resolved.exchange
+    });
+
+    cacheResolved(cacheKey, resolved);
+    return resolved;
+  }
+
+  /* ------------------------------------------------------------------------
+     Private: fetch with one-shot resolution retry
+     ------------------------------------------------------------------------ */
+  private async fetchWithResolution<T extends TwelveDataErrorFields>(
+    asset: Asset,
+    endpoint: string,
+    extraParams: Record<string, string>,
+    apiKey: string
+  ): Promise<FetchOutcome<T>> {
+    const cacheKey = normalizeUserInput(asset.symbol);
+    const firstSymbol = toProviderSymbol(asset);
+
+    const firstUrl = buildUrl(
+      endpoint,
+      { ...extraParams, symbol: firstSymbol },
+      apiKey
+    );
+    const first = await safeFetch<T>(firstUrl, { isQuoteLikeEndpoint: true });
+
+    if (first.ok) return first;
+
+    if (first.classified?.errorCode !== ERROR_CODES.INVALID_SYMBOL) {
+      /* Non-symbol failures are terminal for the request. */
+      return first;
+    }
+
+    logEvent('symbol_recovery_start', {
+      endpoint,
+      query: cacheKey,
+      attemptedSymbol: firstSymbol
+    });
+
+    const resolved = await this.resolveProviderSymbol(cacheKey, asset, apiKey);
+    if (!resolved) return first;
+
+    if (resolved.providerSymbol === firstSymbol) {
+      /* Search confirmed the same symbol we already tried. No point in
+         retrying — the outcome will not change. */
+      logEvent('symbol_recovery_same_symbol', {
+        endpoint,
+        query: cacheKey,
+        providerSymbol: resolved.providerSymbol
+      });
+      return first;
+    }
+
+    const retryUrl = buildUrl(
+      endpoint,
+      { ...extraParams, symbol: resolved.providerSymbol },
+      apiKey
+    );
+    const retry = await safeFetch<T>(retryUrl, { isQuoteLikeEndpoint: true });
+
+    if (retry.ok) {
+      logEvent('symbol_recovery_ok', {
+        endpoint,
+        query: cacheKey,
+        resolvedSymbol: resolved.providerSymbol
+      });
+      return retry;
+    }
+
+    /* Symbol was found by search but the endpoint still rejected it.
+       That is a plan limitation on the resolved exchange — DATA_UNAVAILABLE
+       is the honest classification. Do not let it look like INVALID_SYMBOL. */
+    if (retry.classified?.errorCode === ERROR_CODES.INVALID_SYMBOL) {
+      logEvent('symbol_recovery_plan_limited', {
+        endpoint,
+        query: cacheKey,
+        resolvedSymbol: resolved.providerSymbol
+      });
+      return {
+        ok: false,
+        body: retry.body,
+        classified: {
+          dataStatus: 'unavailable',
+          errorCode: ERROR_CODES.DATA_UNAVAILABLE
+        }
+      };
+    }
+
+    logEvent('symbol_recovery_retry_failed', {
+      endpoint,
+      query: cacheKey,
+      resolvedSymbol: resolved.providerSymbol,
+      errorCode: retry.classified?.errorCode ?? 'UNKNOWN'
+    });
+
+    return retry.classified ? retry : first;
+  }
+
+  /* ==========================================================================
+     resolveSymbol — public interface method
+     ========================================================================== */
+  async resolveSymbol(query: string): Promise<ResolvedProviderSymbol | null> {
+    const key = this.readKey();
+    if (!key) return null;
+
+    const normalized = normalizeUserInput(query);
+    if (!normalized) return null;
+
+    const registryAsset = resolveAsset(query);
+    const asset: Asset = registryAsset ?? {
+      symbol: normalized,
+      name: normalized,
+      market: 'stocks',
+      exchange: '',
+      country: null,
+      currency: 'USD',
+      assetType: 'equity'
+    };
+
+    return this.resolveProviderSymbol(normalized, asset, key);
+  }
+
   /* ==========================================================================
      Quote
      ========================================================================== */
@@ -346,10 +496,12 @@ export class TwelveDataProvider implements MarketDataProvider {
       return this.emptyEnvelope(asset, 'unavailable', ERROR_CODES.DATA_UNAVAILABLE);
     }
 
-    const providerSymbol = toProviderSymbol(asset);
-    const url = buildUrl('/quote', { symbol: providerSymbol }, key);
-
-    const outcome = await safeFetch<TwelveDataQuoteBody>(url);
+    const outcome = await this.fetchWithResolution<TwelveDataQuoteBody>(
+      asset,
+      '/quote',
+      {},
+      key
+    );
 
     if (!outcome.ok || !outcome.body) {
       const c: ClassifiedError = outcome.classified ?? {
@@ -361,16 +513,10 @@ export class TwelveDataProvider implements MarketDataProvider {
 
     const body = outcome.body;
 
-    /* --- Freshness classification ----------------------------------------
-       Twelve Data's quote includes a unix `timestamp`. We claim 'realtime'
-       ONLY when that value is present and within the last 60 seconds.
-       Otherwise, conservatively 'delayed'. */
     let dataStatus: NormalizedMarketData['dataStatus'] = 'delayed';
     if (typeof body.timestamp === 'number' && body.timestamp > 0) {
       const ageSec = Date.now() / 1000 - body.timestamp;
-      if (ageSec >= 0 && ageSec <= 60) {
-        dataStatus = 'realtime';
-      }
+      if (ageSec >= 0 && ageSec <= 60) dataStatus = 'realtime';
     }
 
     const close = parseNumber(body.close);
@@ -378,14 +524,8 @@ export class TwelveDataProvider implements MarketDataProvider {
     const high = parseNumber(body.high);
     const low = parseNumber(body.low);
 
-    /* If every price-ish field is missing, the response is useless even
-       though HTTP 200 arrived. Report it as unavailable, not as success. */
     if (close === null && open === null && high === null && low === null) {
-      return this.emptyEnvelope(
-        asset,
-        'unavailable',
-        ERROR_CODES.DATA_UNAVAILABLE
-      );
+      return this.emptyEnvelope(asset, 'unavailable', ERROR_CODES.DATA_UNAVAILABLE);
     }
 
     const timestamp = body.datetime
@@ -410,10 +550,6 @@ export class TwelveDataProvider implements MarketDataProvider {
 
   /* ==========================================================================
      Price
-     --------------------------------------------------------------------------
-     Twelve Data's /price response carries NO timestamp and no freshness
-     signal. We therefore NEVER claim 'realtime' here — the conservative
-     'delayed' status is the honest answer whenever a price is present.
      ========================================================================== */
   async getPrice(asset: Asset): Promise<NormalizedMarketData | null> {
     const key = this.readKey();
@@ -421,10 +557,12 @@ export class TwelveDataProvider implements MarketDataProvider {
       return this.emptyEnvelope(asset, 'unavailable', ERROR_CODES.DATA_UNAVAILABLE);
     }
 
-    const providerSymbol = toProviderSymbol(asset);
-    const url = buildUrl('/price', { symbol: providerSymbol }, key);
-
-    const outcome = await safeFetch<TwelveDataPriceBody>(url);
+    const outcome = await this.fetchWithResolution<TwelveDataPriceBody>(
+      asset,
+      '/price',
+      {},
+      key
+    );
 
     if (!outcome.ok || !outcome.body) {
       const c: ClassifiedError = outcome.classified ?? {
@@ -435,13 +573,8 @@ export class TwelveDataProvider implements MarketDataProvider {
     }
 
     const price = parseNumber(outcome.body.price);
-
     if (price === null) {
-      return this.emptyEnvelope(
-        asset,
-        'unavailable',
-        ERROR_CODES.DATA_UNAVAILABLE
-      );
+      return this.emptyEnvelope(asset, 'unavailable', ERROR_CODES.DATA_UNAVAILABLE);
     }
 
     return {
@@ -461,22 +594,14 @@ export class TwelveDataProvider implements MarketDataProvider {
   }
 
   /* ==========================================================================
-     OHLCV / bars
-     --------------------------------------------------------------------------
-     Return semantics (interface contract):
-       null → provider failure (missing key, HTTP error, malformed body)
-       []   → provider succeeded but returned no bars for this query
+     OHLCV
      ========================================================================== */
   async getOHLCV(
     asset: Asset,
     timeframe: Timeframe,
     limit: number
   ): Promise<NormalizedMarketData[] | null> {
-    /* Invalid interval is a caller-side error. Return null so the API layer
-       can respond with INVALID_INTERVAL. Do not consume an upstream credit. */
-    if (!TD_ALLOWED_INTERVALS.includes(timeframe)) {
-      return null;
-    }
+    if (!TD_ALLOWED_INTERVALS.includes(timeframe)) return null;
 
     const boundedLimit = Math.max(
       1,
@@ -489,23 +614,16 @@ export class TwelveDataProvider implements MarketDataProvider {
     const key = this.readKey();
     if (!key) return null;
 
-    const providerSymbol = toProviderSymbol(asset);
-    const url = buildUrl(
+    const outcome = await this.fetchWithResolution<TwelveDataSeriesBody>(
+      asset,
       '/time_series',
-      {
-        symbol: providerSymbol,
-        interval: timeframe,
-        outputsize: String(boundedLimit)
-      },
+      { interval: timeframe, outputsize: String(boundedLimit) },
       key
     );
 
-    const outcome = await safeFetch<TwelveDataSeriesBody>(url);
     if (!outcome.ok || !outcome.body) return null;
 
-    const values = Array.isArray(outcome.body.values)
-      ? outcome.body.values
-      : [];
+    const values = Array.isArray(outcome.body.values) ? outcome.body.values : [];
     const currency = outcome.body.meta?.currency || asset.currency;
 
     return values.map((v) => ({
@@ -527,11 +645,7 @@ export class TwelveDataProvider implements MarketDataProvider {
   }
 
   /* ==========================================================================
-     Historical (explicit date range)
-     --------------------------------------------------------------------------
-     Same null/empty semantics as getOHLCV. Phase 4A uses a fixed '1day'
-     interval for history; a future phase can extend the signature with an
-     interval parameter if needed.
+     Historical
      ========================================================================== */
   async getHistoricalData(
     asset: Asset,
@@ -541,11 +655,10 @@ export class TwelveDataProvider implements MarketDataProvider {
     const key = this.readKey();
     if (!key) return null;
 
-    const providerSymbol = toProviderSymbol(asset);
-    const url = buildUrl(
+    const outcome = await this.fetchWithResolution<TwelveDataSeriesBody>(
+      asset,
       '/time_series',
       {
-        symbol: providerSymbol,
         interval: '1day',
         start_date: fromISO,
         end_date: toISO,
@@ -554,12 +667,9 @@ export class TwelveDataProvider implements MarketDataProvider {
       key
     );
 
-    const outcome = await safeFetch<TwelveDataSeriesBody>(url);
     if (!outcome.ok || !outcome.body) return null;
 
-    const values = Array.isArray(outcome.body.values)
-      ? outcome.body.values
-      : [];
+    const values = Array.isArray(outcome.body.values) ? outcome.body.values : [];
     const currency = outcome.body.meta?.currency || asset.currency;
 
     return values.map((v) => ({
@@ -582,33 +692,17 @@ export class TwelveDataProvider implements MarketDataProvider {
 
   /* ==========================================================================
      Market status
-     --------------------------------------------------------------------------
-     HONEST reporting:
-       • enabled:       true for every market the backend supports.
-       • dataConnected: ALWAYS false in Phase 4A.
-         A key being present is not proof that any specific market is being
-         served. The plan may not cover it, the symbol may be unsupported,
-         or the key may be invalid. Verification happens in a later phase and
-         will flip this to true only for markets that have been verified
-         end-to-end.
      ========================================================================== */
   async getMarketStatus(): Promise<Record<string, ProviderMarketStatus>> {
     const out: Record<string, ProviderMarketStatus> = {};
     for (const id of MARKET_IDS) {
-      out[id] = {
-        enabled: true,
-        dataConnected: false
-      };
+      out[id] = { enabled: true, dataConnected: false };
     }
     return out;
   }
 
   /* ==========================================================================
-     Search
-     --------------------------------------------------------------------------
-     Twelve Data offers /symbol_search, but wiring it up would consume
-     credits and is not needed in Phase 4A. The local AssetResolver remains
-     the search path. Return [] to satisfy the interface.
+     searchAssets — interface-compat shim
      ========================================================================== */
   async searchAssets(_query: string): Promise<Asset[]> {
     return [];
