@@ -15,6 +15,7 @@
     "deploy": "wrangler deploy",
     "deploy:prod": "wrangler deploy --env production",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run"
     "tail": "wrangler tail",
     "tail:prod": "wrangler tail --env production",
     "whoami": "wrangler whoami",
@@ -23,6 +24,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240909.0",
     "typescript": "^5.5.4",
+    "vitest": "^2.1.4"
     "wrangler": "^3.78.0"
   },
   "keywords": [
